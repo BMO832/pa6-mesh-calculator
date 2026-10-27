@@ -1,1 +1,1 @@
-"""Independent PA6 Mesh Calculator V5 package."""
+"""PA6 V5: physical design and illustrative porewater allocation."""

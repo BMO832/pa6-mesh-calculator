@@ -1,260 +1,196 @@
-"""Run from repository root: python -m streamlit run v5/app.py"""
-import sys, math, csv, io
+"""V5 replacement; existing V1-V4 entrypoints remain unchanged."""
+import sys
 from pathlib import Path
 sys.path.insert(0,str(Path(__file__).resolve().parent.parent))
 import streamlit as st
-from v5.engine import Design, geometry, exposures, pore_volume, solid_loading, PRESETS, HALF_LIVES, PNEC
-from v4.model import CHEMICALS
-from v4.mesh_engine import SQUARE, ROTATED
+from v5.engine import Design, STRAW, MEASURED, SQUARE, ROTATED, PRESETS, CHEMICALS, HALF_LIVES, build_model, design_comparison
+from v5.preview import design_preview
+from v5.panel import show_panel
+from v5.reporting import report, export_csv, SAND
+from v5.sources import PW_LABEL, PW_NOTE, BURROW_NOTE, HALF_NOTE, HYPOTHETICAL, LIMITS, PNEC_NOTE, SOURCES, explain
+
+
+def apply_preset():
+    name=st.session_state['preset']
+    if name in PRESETS:
+        s,n,h=PRESETS[name]
+        st.session_state.update(structure=STRAW,dw=3.,df=1.2,spacing=s,n=n,h=h,path=1.6,crimp=1.05,rib_period=5)
+    elif name=='R1': st.session_state.update(structure=SQUARE,dw=3.,spacing=12.)
+    elif name=='R2': st.session_state['structure']=MEASURED
+
+
+def apply_width():
+    if st.session_state['width_preset']!='직접 입력': st.session_state['width']=float(st.session_state['width_preset'])
+
+
+def apply_saturation():
+    if st.session_state['sat_preset']!='직접 입력': st.session_state['sat']=float(st.session_state['sat_preset'].rstrip('%'))
+
+
+def number(label,key,value,**kwargs):
+    if key not in st.session_state: st.session_state[key]=value
+    return st.number_input(label,key=key,**kwargs)
+
+
+def chart(rows,title,xtitle,ytitle,log=False):
+    st.subheader(title)
+    if not rows:
+        st.info('계산 불가: 공극수 없음'); return
+    if log and any(r['y']<=0 for r in rows):
+        st.caption('0 값은 로그축에 표시할 수 없어 선형축을 사용합니다.'); log=False
+    st.vega_lite_chart(spec={'data':{'values':rows},'mark':{'type':'line'},'encoding':{
+        'x':{'field':'x','type':'quantitative','title':xtitle},
+        'y':{'field':'y','type':'quantitative','title':ytitle,'scale':{'type':'log' if log else 'linear'}},
+        'color':{'field':'series','type':'nominal','title':'물질·시나리오'},
+        'tooltip':[{'field':'series'},{'field':'x'},{'field':'y','format':'.6g'},{'field':'note'}]}},width='stretch')
+
 
 st.set_page_config(page_title='PA6 Mesh Calculator V5',layout='wide')
-st.markdown('''<style>[data-testid="stLatex"]{overflow-x:auto;max-width:100%}@media(max-width:850px){[data-testid="stHorizontalBlock"]{flex-direction:column}[data-testid="stColumn"]{min-width:0;width:100%}}</style>''',unsafe_allow_html=True)
+st.markdown('''<style>
+[data-testid="stLatex"] {overflow-x:auto; max-width:100%;}
+[data-testid="stLatex"] .katex-display {overflow-x:auto; overflow-y:hidden; padding:.4rem 0;}
+@media(max-width:850px){[data-testid="stHorizontalBlock"]{flex-direction:column;}[data-testid="stColumn"]{width:100%;flex:1 1 100%;min-width:0;}}
+</style>''',unsafe_allow_html=True)
 st.title('PA6 Mesh Calculator V5')
-st.caption('물리 구조 · 공극수 노출 환산 · 출처/가정 분리 · 30°C · 1-92일 | 실측 노출농도 또는 안전성 판정이 아닙니다.')
-
-SOURCES={
- 'ABA':('미국 Access Board, ABA Chapter 10', 'https://www.access-board.gov/aba/chapter/ch10/','해변 접근로 유효폭 1525 mm 및 개구부 구 통과 13 mm 제한(해당 적용 요건 검토 필요)'),
- 'PA6':('NETZSCH, PA6 자료','https://analyzing-testing.netzsch.com/ko/polrimeo-netzsch-com/engineering-thermoplastics/pa6-polyamide-6','PA6의 일반 물성. 재생 원사 밀도 1130 kg/m³는 팀 가정'),
- 'Bridson':('Bridson et al. (2023), Table 4','https://doi.org/10.1016/j.envadv.2023.100359','30°C 수중 PA6 미세플라스틱 용출 경험식/계수, 올리고머 반정량'),
- 'Fortmann':('Fortmann & Rosenberg (1984)','https://doi.org/10.1016/0045-6535(84)90008-0','카프로락탐 수중 환경 거동 참고. 5-14일을 직접 확인한 실측 반감기로 사용하지 않음'),
- 'OECD':('OECD SIDS, epsilon-Caprolactam','https://hpvchemicals.oecd.org/ui/handler.axd?id=C1609721-9FDF-4D5F-8F15-FB4F50710C72','수환경 PNEC 참고 비교(0.13 mg/L, EC50 130 mg/L / 평가계수 1000)'),
- 'Soil':('Kansas State University, Soil Density','https://kstatelibraries.pressbooks.pub/soilslabmanual/chapter/soil-density/','용적밀도와 입자밀도를 구분한 공극률 관계식'),
- 'ANZG':('ANZG Sediment Toxicant Guidelines','https://www.waterquality.gov.au/anz-guidelines/guideline-values/derive/field-effects/method-toxicants-sediments','퇴적물 노출평가의 일반적 맥락. 본 환산농도 식을 직접 제시하지 않음'),
- 'Peirce':('Peirce (1937), The Geometry of Cloth Structure','https://doi.org/10.1080/19447023708658809','직물의 굴곡에 대한 참고. 팀 고유 직조 공식과 계수의 출처는 아님'),
- 'Clip':('J. Imaging (2022), 선분 클리핑 참고','https://doi.org/10.3390/jimaging8100286','직선-영역 교차 관련 참고. V4 코드를 Liang-Barsky 구현이라고 주장하지 않음'),
- 'Roll':('Rollspec, Roll Diameter Guide','https://rollspec.com/guides/roll-diameter-length/','롤의 원환 면적 기반 기하학적 계산 참고'),
- 'Burrow1':('저서생물 굴 참고 1 (종별 자료 확인 필요)','https://pmc.ncbi.nlm.nih.gov/articles/PMC6494038/','14.4 cm 및 37.6 cm 값의 정확한 귀속·집계 방식 미확인'),
- 'Burrow2':('저서생물 굴 참고 2 (종별 자료 확인 필요)','https://doi.org/10.1163/193724097X00107','굴 깊이 직접 실측값으로 검증하지 않음'),
-}
-
-def cite(key):
-    name,url,scope=SOURCES[key]
-    st.caption(f'출처/참고: {name} — {scope}')
-    st.markdown(f'[원문 링크]({url})')
-
-def info(kind,desc,calibration=False):
-    st.caption(f'수식 구분: {kind} | 출처/조건: {desc}'+(' | 시료 실측 보정 필요' if calibration else ''))
-
-def metric(label,value,unit='',fmt=',.4f'):
-    st.metric(label,(format(value,fmt)+' '+unit) if value is not None else '계산 불가: 공극수 없음')
-
-def st_chart(rows,kind):
-    st.line_chart(rows,x='day',y=kind)
-
-left,right=st.columns([1.05,.95],gap='large')
+st.caption('물리 구조·공극수 노출 통합 | 전량 용존 환산 시나리오 | V5 보완 지시문 반영판')
+left,right=st.columns([1.1,.9],gap='large')
 with left:
     st.header('설계 조건')
-    kind=st.selectbox('구조 및 시료',('C0','A1','A2','A3','A4','R1','R2','직접 짚신형'))
-    wchoice=st.selectbox('너비 프리셋',('1.5 m (팀 비교 기준)','1.525 m (ABA 참고)','1.65 m','1.7 m','직접 입력'))
-    wlookup={'1.5 m (팀 비교 기준)':1.5,'1.525 m (ABA 참고)':1.525,'1.65 m':1.65,'1.7 m':1.7}
-    length=st.number_input('L [m]',min_value=.001,value=10.,format='%.4f')
-    width=st.number_input('W [m]',min_value=.001,value=wlookup.get(wchoice,1.5),format='%.4f') if wchoice=='직접 입력' else wlookup[wchoice]
-    ds=Design(kind=kind,length=length,width=width)
-    if kind in PRESETS:
-        s,n,h=PRESETS[kind]; ds=Design(kind=kind,length=length,width=width,spacing=s,n=n,rib_h=h)
-        st.caption(f'시료 {kind}: s={s:g} mm, N={n:g}회/10cm, 리브 h={h:g} mm. 아래에서 수정 가능')
-    if kind in PRESETS or kind=='직접 짚신형':
-        dw=st.number_input('날줄 직경 [mm]',min_value=.01,value=ds.warp_d)
-        spacing=st.number_input('날줄 중심 간격 [mm]',min_value=.01,value=ds.spacing)
-        df=st.number_input('씨줄 직경 [mm]',min_value=.01,value=ds.weft_d)
-        n=st.number_input('씨줄 밀도 [회/10cm]',min_value=.01,value=ds.n)
-        rib_h=st.number_input('리브 요철 높이 [mm]',min_value=0.,value=ds.rib_h)
-        period=st.number_input('리브 주기 [회당 1회]',min_value=1,value=5,step=1)
-        k=st.number_input('씨줄 경로계수',min_value=.001,value=1.6)
-        cw=st.number_input('날줄 굴곡계수',min_value=.001,value=1.05)
-        ds=Design(kind=kind,length=length,width=width,warp_d=dw,spacing=spacing,weft_d=df,n=n,
-                  rib_h=rib_h,rib_period=period,k=k,cw=cw)
+    st.selectbox('시료 프리셋',['C0','A1','A2','A3','A4','R1','R2'],key='preset',on_change=apply_preset)
+    st.caption('프리셋은 시작 설계값입니다. 아래 값을 바꾸면 현재 사용자 조건으로 계산합니다.')
+    structure=st.selectbox('직조 구조',[STRAW,SQUARE,ROTATED,MEASURED],key='structure')
+    length=number('이동로 길이 L [m]','length',10.,format='%.4f')
+    st.selectbox('너비 프리셋 [m]',['1.5','1.525','1.65','1.7','직접 입력'],key='width_preset',on_change=apply_width)
+    width=number('이동로 너비 W [m]','width',1.5,format='%.4f')
+    st.caption('1.5 m는 팀 비교값. 1.525 m는 미국 ABA 해변 접근로 유효폭 참고값이며 적용 여부는 별도 검토입니다.')
+    kw=dict(structure=structure,length=length,width=width)
+    if structure==MEASURED:
+        st.info('R2는 시판 매트의 해당 크기 시료 실측값을 입력합니다. 미입력값을 추정하지 않습니다.')
+        for key,label in [('measured_mass','실측 총질량 [kg]'),('measured_area','실측 전체 소재 표면적 [m²]'),
+                          ('measured_thickness','실측 유효 두께 [mm]'),('measured_cross','실측 진행 직각 틈 [mm]'),('measured_long','실측 진행 방향 틈 [mm]')]:
+            kw[key]=number(label,key,0.,min_value=0.)
+        kw['measured_pa6']=st.checkbox('R2 시료가 PA6이며 입력 질량 전체에 PA6 용출식을 적용할 수 있음을 확인',key='measured_pa6')
     else:
-        st.caption('R1은 V4 직교 격자형, R2는 실측값을 직접 입력하는 시판 매트 비교군입니다.')
-        ref_d=st.number_input('필라멘트 직경 [mm]',min_value=.01,value=3.)
-        ref_s=st.number_input('필라멘트 중심 간격 [mm]',min_value=.01,value=12.)
-        structure=st.selectbox('격자 구조', (SQUARE,ROTATED),index=0,disabled=(kind=='R1'))
-        mm=ma=None
-        if kind=='R2':
-            use_measured=st.checkbox('실측 질량 및 표면적 사용',value=False)
-            if use_measured:
-                mm=st.number_input('실측 PA6 질량 [kg]',min_value=.00001,value=20.)
-                ma=st.number_input('실측 표면적 [m²]',min_value=.00001,value=24.)
-        ds=Design(kind=kind,length=length,width=width,reference_d=ref_d,reference_s=ref_s,
-                  reference_structure=structure,measured_mass=mm,measured_area=ma)
-    rho=st.number_input('PA6 밀도 [kg/m³]',min_value=.001,value=1130.)
-    recovery=st.number_input('원료 회수율 [%]',min_value=.01,max_value=100.,value=60.)/100
-    core=st.number_input('롤 심지 직경 [m]',min_value=.001,value=.15)
-    from dataclasses import replace
-    ds=replace(ds,rho=rho,recovery=recovery,core=core)
-    try:
-        g=geometry(ds)
-    except (ValueError,OverflowError) as e:
-        st.error(str(e)); st.stop()
-    st.subheader('물리 구조 결과')
-    a,b=st.columns(2)
-    with a:
-        metric('PA6 전체 질량',g['mass'],'kg')
-        metric('매트 전체 표면적',g['area'],'m²')
-        metric('진행 직각 틈',g['gap_cross'],'mm')
-    with b:
-        metric('전체 필라멘트 길이',g['total_length'],'m')
-        metric('필요 폐어망',g['waste'],'kg')
-        metric('진행 방향 틈',g['gap_long'],'mm')
-    st.caption(f"두께 {g['thickness_base']*1000:.3f}-{g['thickness_rib']*1000:.3f} mm | 롤 지름 {g['roll_base']*100:.2f}-{g['roll_rib']*100:.2f} cm")
-    st.caption('내부 목표: 진행 직각 틈 10 mm 이하, 진행 방향 틈 6.5 mm 이하(법적 기준 아님). ABA 개구부 기준 약 13 mm는 구 통과 기준으로 단순 1차원 틈과 동일한 판정이 아닙니다.')
-    # Geometric conceptual visualization, never claims 3D physical weave.
-    if kind in PRESETS or kind=='직접 짚신형':
-        st.markdown('**짚신형 개념 미리보기(실제 리브 단면 또는 실 굴곡 미재현)**')
-        horiz=''.join(f'<line x1="0" y1="{i*13}" x2="360" y2="{i*13}" stroke="{("#bc7f33" if i%5==0 else "#748fa6")}" stroke-width="{(5 if i%5==0 else 2)}"/>' for i in range(1,14))
-        vert=''.join(f'<line x1="{i*13}" y1="0" x2="{i*13}" y2="185" stroke="#556e88" stroke-width="3"/>' for i in range(1,27))
-        st.markdown(f'<svg viewBox="0 0 360 185" style="max-width:100%;background:#edf1f4">{vert}{horiz}</svg>',unsafe_allow_html=True)
-    st.divider()
+        kw['dw']=number('날줄/기존 격자 직경 d_w [mm]','dw',3.,format='%.4f')
+        kw['spacing']=number('날줄/격자 중심 간격 s [mm]','spacing',12.,format='%.4f',help='회전 격자는 인접 평행선 사이 수직 거리입니다.')
+        if structure==STRAW:
+            kw['df']=number('씨줄 직경 d_f [mm]','df',1.2,format='%.4f')
+            kw['n']=number('씨줄 밀도 N [회/10cm]','n',20.,format='%.4f')
+            kw['h']=number('요철 높이 h [mm]','h',1.,min_value=0.,format='%.4f')
+            kw['rib_period']=number('리브 주기 [회당 1회]','rib_period',5,min_value=1,step=1)
+            kw['path']=number('씨줄 경로계수 k','path',1.6,min_value=1.)
+            kw['crimp']=number('날줄 굴곡계수 c_w','crimp',1.05,min_value=1.,format='%.4f')
+    kw['rho']=number('PA6 대표 밀도 [kg/m³]','rho',1130.)
+    kw['recovery']=number('원료 회수율 [%]','recovery',60.,min_value=.1,max_value=100.)/100
+    kw['core']=number('심지관 외경 [m]','core',.15,format='%.4f')
+    st.caption('경로계수·굴곡계수·리브 형상·회수율은 팀 가정으로 시료 실측 후 보정합니다.')
     st.header('화학물질 및 환경 조건')
-    chosen=st.multiselect('화학물질',list(CHEMICALS),default=['Caprolactam'])
-    days=st.slider('기간 [일]',1,92,7)
-    if days>64: st.warning('65-92일은 Bridson의 1-64일 실험 범위를 넘어서는 경험식 외삽 구간입니다.')
-    buried=st.slider('매몰부 표면적 비율 [%]',0,100,50)/100
-    eta=st.slider('매몰부 유래 공극수 이동·유지 비율 [%]',0,100,100)/100
-    metric('매몰부 추정 표면적 (공극수 접촉 가능 영역)',g['area']*buried,'m²')
-    st.caption(f"비매몰부 표면적(보조 항목): {g['area']*(1-buried):.4f} m² | 매몰부가 실제로 지속 젖은 면적이라는 뜻은 아닙니다.")
-    bulk=st.number_input('모래 건조 용적밀도 [kg/m³]',min_value=.01,value=1500.)
-    particle=st.number_input('모래 입자밀도 [kg/m³]',min_value=.01,value=2650.)
-    swchoice=st.selectbox('수분 포화도 시나리오',('25%','50%','100%','직접 입력'),index=1)
-    sw=st.number_input('직접 포화도 [%]',min_value=0.,max_value=100.,value=50.)/100 if swchoice=='직접 입력' else float(swchoice[:-1])/100
-    depth=st.number_input('모래 선택 혼합 깊이 [cm]',min_value=.1,max_value=130.,value=10.)
-    halfs={}
-    for name in chosen:
-        opts=('분해 미반영','5일','9.5일','14일')
-        idx=2 if name=='Caprolactam' else 0
-        label=st.selectbox(f'{name} — 반감기',opts,index=idx)
-        halfs[name]={'분해 미반영':None,'5일':5.,'9.5일':9.5,'14일':14.}[label]
-        if name!='Caprolactam' and halfs[name]: st.warning(f'{name}: 직접 검증된 반감기 없음. 카프로락탐 시나리오를 차용한 가상 민감도 분석')
+    names=st.multiselect('화학물질',list(CHEMICALS),default=['Caprolactam'],key='chemicals')
+    days=st.slider('수중 접촉을 가정한 평가 기간 [day]',1,92,7,key='days')
+    st.caption('92일은 7-9월 설치를 고려한 시나리오입니다. 실제 해변 설치일수와 수중 접촉일수는 같지 않습니다.')
+    if days>64: st.warning('65-92일은 Bridson 경험식의 외삽 범위입니다. 실제 환경의 최대 용출량을 뜻하지 않습니다.')
+    burial=number('매몰부 표면적 비율 [%]','burial',50.,min_value=0.,max_value=100.)/100
+    halves={}; etas={}
+    for name in names:
+        oligomer=CHEMICALS[name].semiquantitative
+        options=['분해 미반영']+[('가상 ' if oligomer else '참고 ')+f'{h:g}일' for h in HALF_LIVES[1:]]
+        selected=st.selectbox(name+' 반감기',options,index=0 if oligomer else 2,key='half_'+name)
+        halves[name]=HALF_LIVES[options.index(selected)]
+        etas[name]=number(name+' 공극수 이동·유지율 eta [%]','eta_'+name,100.,min_value=0.,max_value=100.)/100
+        if oligomer:
+            st.caption('올리고머 용출 자료는 반정량이며 실제 용존량으로 확정하지 않습니다.')
+            if halves[name] is not None: st.warning(HYPOTHETICAL)
+        else: st.caption(HALF_NOTE)
+    density=number('건조 모래 용적밀도 ρb [kg/m³]','density',1500.,help='공극 포함 전체 부피당 건조 질량입니다. 방아머리 실측값이 아닌 가정값입니다.')
+    particle=number('모래 입자밀도 ρs [kg/m³]','particle',2650.)
+    st.selectbox('수분 포화도 시나리오',['25%','50%','100%','직접 입력'],index=1,key='sat_preset',on_change=apply_saturation)
+    saturation=number('수분 포화도 S_w [%]','sat',50.,min_value=0.,max_value=100.,format='%.4f')/100
+    depth=number('선택 혼합 깊이 [cm]','depth',10.,min_value=.1,max_value=130.,step=.1)
+    surface=number('표층 시나리오 두께 [cm]','surface',1.,min_value=.1,max_value=5.,step=.1)
+    average=number('굴 깊이 참고 시나리오 1 [cm] (출처 확인 필요)','average',14.4,min_value=.1,max_value=130.,step=.1)
+    maximum=number('굴 깊이 참고 시나리오 2 [cm] (출처 확인 필요)','maximum',37.6,min_value=.1,max_value=130.,step=.1)
+    st.caption('14.4·37.6 cm의 대상종·원문·대표값 산정 방식은 확인 필요. 평균 생활 깊이나 실제 오염 도달 깊이로 확정하지 않습니다.')
     try:
-        if not chosen: raise ValueError('화학물질을 하나 이상 선택하세요.')
-        result={name:exposures(g['mass'],name,days,buried,eta,halfs[name],g['plan'],depth,bulk,particle,sw) for name in chosen}
-    except (ValueError,OverflowError) as e:
-        st.error(str(e)); st.stop()
-    st.divider()
-    st.header('노출 평가 결과')
-    st.caption('전량 용존 가정의 공극수 환산농도 (mg/L): 실제 용존 농도가 아닌 단순 완전혼합 환산값')
-    rows=[]; csv_rows=[]; comparison=[]
-    for name,r in result.items():
-        q=r['current']; rows.append({'물질':name,'누적 총 용출량 [mg]':q['total_mg'],
-             '공극수 배분 누적량 [mg]':q['allocated_mg'],'공극수 잔존량 [mg]':q['remaining_mg'],
-             '공극수 부피 [L]':q['volume_l'],'선택일 환산농도 [mg/L]':q['concentration'],
-             '최고 환산농도 [mg/L]':r['peak'],'최고일':r['peak_day'],
-             '산술평균 환산농도 [mg/L]':r['average'],
-             '모래층 전체 용출부하 [mg/kg dry sand]':solid_loading(q['total_mg'],g['plan'],depth,bulk)})
-        for qd in r['rows']:
-            csv_rows.append({'물질':name,**qd,'매몰률':buried,'이동·유지율':eta,'포화도':sw,'혼합 깊이 cm':depth})
-        for sat in (.25,.50,1.):
-            cases=[('분해 미반영',None)]
-            if halfs[name] is not None: cases.append(('선택 반감기',halfs[name]))
-            for label,half in cases:
-                x=exposures(g['mass'],name,days,buried,eta,half,g['plan'],depth,bulk,particle,sat)
-                comparison.append({'물질':name,'포화도':f'{sat*100:g}%','분해 설정':label,
-                   '선택일 [mg/L]':x['current']['concentration'],'최고 [mg/L]':x['peak'],
-                   '최고일':x['peak_day'],'산술평균 [mg/L]':x['average']})
-    st.dataframe(rows,hide_index=True,use_container_width=True)
-    st.caption('모래 mg/kg는 V4 전체 소재의 누적 용출량을 모두 모래층에 남긴 독립적 총부하 시나리오입니다. 공극수 구획 잔존량과 더해 물질수지를 계산하지 않습니다.')
-    st.subheader('포화도 25%, 50%, 100% 및 분해조건 비교')
-    st.dataframe(comparison,hide_index=True,use_container_width=True)
-    st.caption('동일한 PA6 구조, 배분율, 혼합 깊이 조건의 독립 시나리오입니다. 선택일·최고·산술평균 환산농도는 체내 흡수량이나 실측 시간가중 노출이 아닙니다.')
-    st.subheader('깊이별 잠재적 공극수 접촉농도')
-    depths=[('표층 1cm까지 완전혼합 시나리오',1.),('표층 10cm까지 완전혼합 시나리오',10.),
-            ('14.4cm까지 완전혼합 시나리오 (문헌 확인 필요)',14.4),
-            ('37.6cm까지 완전혼합 시나리오 (문헌 확인 필요)',37.6),
-            (f'직접 입력 {depth:g}cm까지 완전혼합 시나리오',depth)]
-    layer_rows=[]
-    for name in chosen:
-        for label,z in depths:
-            x=exposures(g['mass'],name,days,buried,eta,halfs[name],g['plan'],z,bulk,particle,sw)
-            layer_rows.append({'물질':name,'깊이 시나리오':label,'공극수 부피 [L]':x['volume_l'],
-                               '굴 깊이 기준 잠재적 공극수 접촉농도 [mg/L]':x['current']['concentration']})
-    st.dataframe(layer_rows,hide_index=True,use_container_width=True)
-    st.caption('해당 깊이까지의 공극수가 균일하게 혼합된다는 가정에 따른 참고 농도로 실제 굴 내부의 용존 농도나 개체의 체내 흡수량이 아닙니다. 깊이별 값은 실제 수직 농도분포가 아닙니다. 달랑게류 및 긴꼬리도약옆새우류의 굴 깊이 귀속은 문헌 확인 필요.')
-    st.subheader('카프로락탐 OECD PNEC 참고 비율')
-    if 'Caprolactam' in result:
-        rr=result['Caprolactam']['pnec_ratios']
-        st.dataframe([{'구분':k,'OECD 수환경 PNEC [mg/L]':PNEC,'참고 비교 비율':rr[key]} for k,key in
-                      [('선택일','current'),('기간 최고','peak'),('기간 산술평균','average')]],hide_index=True)
-        st.caption('OECD PNEC는 조상대 달랑게류·긴꼬리도약옆새우류에 직접 검증한 기준이 아닙니다. 1 초과/미만은 생태계 피해 또는 안전 판정이 아닙니다.')
-    else: st.info('카프로락탐 선택 시 참고 비교를 표시합니다. 올리고머의 PNEC는 설정하지 않았습니다.')
-    st.subheader('시간별 공극수 환산농도')
-    chart_rows=[{'day':r['day'],'물질':name,'mg/L':r['concentration']} for name,v in result.items() for r in v['rows']]
-    st.line_chart(chart_rows,x='day',y='mg/L',color='물질')
-    st.subheader('R1 - C0 기준 구조 비교')
-    refs=[]
-    for key in ('R1','C0'):
-        ref=geometry(Design(kind=key,length=length,width=width))
-        refs.append({'구조':key,'질량 [kg]':ref['mass'],'표면적 [m²]':ref['area'],'진행 직각 틈 [mm]':ref['gap_cross'],'진행 방향 틈 [mm]':ref['gap_long']})
-    st.dataframe(refs,hide_index=True)
-    buff=io.StringIO(); writer=csv.DictWriter(buff,fieldnames=list(csv_rows[0]));writer.writeheader();writer.writerows(csv_rows)
-    st.download_button('일별 결과 CSV 다운로드',buff.getvalue().encode('utf-8-sig'),file_name='pa6_v5_daily.csv',mime='text/csv')
-
+        model=build_model(Design(**kw),names,days,halves,etas,burial,density,particle,saturation,depth,surface,average,maximum)
+    except (ValueError,OverflowError,ZeroDivisionError) as exc:
+        st.error(str(exc))
+        with right: st.info('유효한 입력을 지정하면 계산 과정이 표시됩니다.')
+        st.stop()
+    p=model['physical']; data=report(model)
+    st.subheader('물리 설계 결과')
+    for label,value,unit in [('매트 평면면적',p['area'],'m²'),('전체 소재 표면적',p['surface'],'m²'),
+                             ('매몰부 추정 표면적 (공극수 접촉 가능 영역)',p['buried'],'m²'),('총질량',p['mass'],'kg')]:
+        st.metric(label,f'{value:,.6f} {unit}')
+    if p['length'] is not None: st.metric('전체 필라멘트 길이',f"{p['length']:,.6f} m")
+    st.caption(f"보조: 비매몰 면적 {p['unburied']:.6f} m². 매몰부는 실제 수분 접촉 면적의 실측값이 아닙니다.")
+    physical_row={'진행 직각 틈 [mm]':p['cross'],'진행 방향 틈 [mm]':p['long'],
+                  '기본 두께 [mm]':p['t_base']*1000,'리브 두께 [mm]':p['t_rib']*1000,
+                  '기본 두께 롤 지름 [cm]':p['roll_base']*100,'리브 두께 롤 지름 [cm]':p['roll_rib']*100,
+                  '회수율 가정 원료 소요량 [kg]':p['waste']}
+    st.dataframe([physical_row],hide_index=True)
+    if structure==ROTATED: st.caption(f"평행 원사 사이 수직 틈: {p['normal_gap']:g} mm. 진행방향 개구 치수와는 다릅니다.")
+    st.markdown(design_preview(p),unsafe_allow_html=True)
+    st.caption('2D 개념도: 일부 중심선만 표시합니다. 짚신형은 파랑 날줄·회색 일반 씨줄·주황 리브이며 실제 굴곡이나 원사 직경을 축척 재현하지 않습니다. R2는 외곽만 표시합니다.')
+    st.subheader('R1·C0 및 시료 설계 비교')
+    comparisons=design_comparison(length,width,kw['rho'],kw['recovery'],kw['core'])
+    comparisons['현재 입력']=p
+    st.dataframe([{'설계':name,'질량 [kg]':x['mass'],'표면적 [m²]':x['surface'],
+                   '직각 틈 [mm]':x['cross'],'진행 틈 [mm]':x['long'],'기본 두께 [mm]':x['t_base']*1000,
+                   '리브 두께 [mm]':x['t_rib']*1000,'롤 지름(리브) [cm]':x['roll_rib']*100,'원료 [kg]':x['waste']}
+                  for name,x in comparisons.items()],hide_index=True)
+    st.caption('같은 L·W·밀도·회수율·심지 외경에서 표준 프리셋을 비교합니다. 10 mm(진행 직각), 6.5 mm(진행 방향)는 팀 내부 목표이며 법적 기준이 아닙니다. ABA 13 mm는 구 통과 기준으로 단순 틈 계산만으로 적합성을 판단하지 않습니다.')
+    if not model['chemicals']:
+        st.info('R2 재질이 확인되지 않아 PA6 화학 모델을 적용하지 않았습니다. PA6 확인 후 계산할 수 있습니다.')
+    else:
+        st.subheader('누적 용출·잔존량 및 농도')
+        st.write(PW_NOTE)
+        if saturation==0: st.warning('계산 불가: 공극수 없음. mg/L·최고·평균·PNEC 비율을 산출하지 않습니다.')
+        elif saturation<.05: st.warning('수분이 매우 적은 가정입니다. 용해도 제한 없이 전량을 나누므로 환산농도가 과도하게 커질 수 있습니다.')
+        st.caption('포화도 25·50·100%는 실측 이전의 대안 시나리오입니다. 100%가 건조 조상대의 일반 조건이라는 의미가 아닙니다.')
+        for c in model['chemicals']:
+            x=c['selected']
+            st.metric(c['name']+' · 선택일 '+PW_LABEL,'계산 불가: 공극수 없음' if x['selected'] is None else f"{x['selected']:,.6f}")
+            if x['selected'] is not None:
+                st.caption(f"기간 최고 {x['peak']:,.6f} mg/L ({x['peak_day']}일째) · 일별 산술평균 {x['average']:,.6f} mg/L")
+        st.dataframe(data['summary'],hide_index=True,column_order=['물질',PW_LABEL,'최고 일별 환산농도 [mg/L]',
+            '최고 발생일 [day]','일별 산술평균 환산농도 [mg/L]','총 누적 용출량 [mg]',
+            '매몰부 배분 누적 유입량 [mg]','공극수 구획 잔존량 [mg]','공극수 부피 [L]',SAND,
+            '전체 환경 잔존량 [mg]','누적 용출률 [%]','소재 면적당 용출량 [mg/m²-PA6]','평면면적당 용출량 [mg/m²]'])
+        st.caption('mg/kg dry sand는 V4와 동일하게 전체 환경 잔존량을 모래 질량으로 나눈 독립 부하량입니다. 공극수로 배분된 질량을 쓰는 mg/L와 합산하거나 같은 노출지표로 취급하지 않습니다.')
+        st.subheader('깊이별 완전혼합 시나리오')
+        st.dataframe(data['layers'],hide_index=True,column_order=['물질','시나리오',PW_LABEL,
+            '굴 깊이 기준 잠재적 공극수 접촉농도 [mg/L]','공극수 부피 [L]',SAND,'건조 모래 질량 [kg]',
+            '모래 부피 [m³]','공극 부피 [m³]','혼합층 두께 [cm]','상태'])
+        st.write('굴 깊이 기준 잠재적 공극수 접촉농도')
+        st.caption(BURROW_NOTE)
+        st.subheader('25·50·100% 포화도 및 반감기 비교')
+        st.dataframe(data['comparison'],hide_index=True,column_order=['물질','시나리오','포화도',PW_LABEL,
+            '최고 일별 환산농도 [mg/L]','최고 발생일 [day]','일별 산술평균 환산농도 [mg/L]',
+            '공극수 부피 [L]','반감기 [day]','반감기 구분'])
+        st.caption('같은 구조·물질·깊이·배분율에 대한 독립 대안입니다. 선택일·1일부터 선택일까지 최고(최초 발생일)·일별 산술평균을 비교합니다. 산술평균은 연속시간 시간가중 노출량이나 체내흡수량이 아닙니다.')
+        st.subheader('카프로락탐 OECD 수환경 PNEC 참고 비교')
+        cap=next((c for c in model['chemicals'] if c['name']=='Caprolactam'),None)
+        if cap:
+            st.dataframe([{'지표':label,'환산농도 [mg/L]':cap['selected'][key],'PNEC [mg/L]':.13,'참고 비교 비율':cap['ratios'][key]}
+                          for key,label in [('selected','선택일'),('peak','기간 최고'),('average','기간 산술평균')]],hide_index=True)
+        else: st.info('카프로락탐을 선택하면 참고 비교를 표시합니다. 올리고머에는 적용하지 않습니다.')
+        st.caption(PNEC_NOTE)
+        explain('oecd')
+        chart(data['rates'],'1-92일 누적 용출률 (65일 이후 외삽)','접촉일 [day]','누적 용출률 [%]')
+        chart(data['mass_time'],'누적 용출량·환경 잔존량','접촉일 [day]','물질량 [mg]')
+        chart(data['pw_time'],'일별 공극수 환산농도 (65일 이후 외삽)','접촉일 [day]',PW_LABEL)
+        log=st.checkbox('깊이별 농도 그래프 y축 로그 표시',key='log')
+        chart(data['sand_curve'],'가정한 혼합층 두께에 따른 모래 총부하량','표면부터 혼합층 두께 [cm]',SAND,log)
+        chart(data['pw_curve'],'가정한 혼합층 두께에 따른 공극수 환산농도','표면부터 혼합층 두께 [cm]',PW_LABEL,log)
+        st.caption('같은 물질량을 더 두꺼운 층에 나누어 평균값이 낮아지는 독립 시나리오입니다. 실제로 깊이에 따라 이 곡선의 농도분포가 형성된다는 뜻이 아닙니다.')
+        st.subheader('물질별 모래층 평균 부하량 비교')
+        st.vega_lite_chart(spec={'data':{'values':data['bars']},'mark':'bar','encoding':{
+            'x':{'field':'chemical','type':'nominal','title':'물질'},'xOffset':{'field':'layer'},
+            'y':{'field':'value','type':'quantitative','title':SAND},'color':{'field':'layer'},
+            'tooltip':[{'field':'chemical'},{'field':'layer'},{'field':'value','format':'.6g'}]}},width='stretch')
+        st.download_button('조건·깊이·노출 비교 CSV 다운로드',export_csv(data['export']),file_name='pa6_v5_scenarios.csv',mime='text/csv')
+    with st.expander('모델 경계·가정·출처 확인 상태'):
+        st.write(LIMITS)
+        for key in SOURCES: explain(key)
 with right:
-    st.header('실시간 계산 원리·출처')
-    with st.expander('1. 직조 구조별 길이·질량·표면적',expanded=True):
-        if kind in PRESETS or kind=='직접 짚신형':
-            st.latex(r'n_w=\lfloor W/s\rfloor+1,\quad n_{all}=\mathrm{round}(10NL)')
-            st.latex(r'n_{rib}=\lfloor n_{all}/p\rfloor,\quad n_{regular}=n_{all}-n_{rib}')
-            st.latex(r'T_w=n_wLc_w,\quad T_f=n_{regular}Wk,\quad T_r=n_{rib}Wk')
-            st.latex(r'd_r=d_f+h,\quad g_{cross}=s-d_w,\quad g_{long}=100/N-d_f')
-            st.latex(r'm=\rho\pi(d_w^2T_w+d_f^2T_f+d_r^2T_r)/4')
-            st.latex(r'A=\pi(d_wT_w+d_fT_f+d_rT_r)')
-            st.write('대입값/계산 결과:',g['details'])
-            info('C 자체 유도 + D 팀 설계 가정',f'날줄 {ds.warp_d:g} mm, 씨줄 {ds.weft_d:g} mm, s={ds.spacing:g} mm, N={ds.n:g}, k={ds.k:g}, cw={ds.cw:g}; 리브는 일반 씨줄을 대체',True)
-            cite('Peirce')
-        else:
-            st.latex(r'N_x=\lfloor W/s\rfloor+1,\quad N_y=\lfloor L/s\rfloor+1')
-            st.latex(r'T=N_xL+N_yW,\quad A=\pi dT,\quad m=\rho\pi d^2T/4')
-            st.write('실제 계산 구조:',g['details'])
-            info('B 기본 기하학 + C 자체 직선 배치/클리핑','R1 직교, R2 지정 직교·회전 구조. 교점 계산에 V4 자체 클리핑 구현 사용',True)
-            cite('Clip')
-        st.latex(r'D_{roll}=\sqrt{D_{core}^2+4Lt/\pi},\quad m_{waste}=m/recovery')
-        st.write(f"PA6 {g['mass']:.6f} kg · 표면적 {g['area']:.6f} m² · 롤 {g['roll_base']:.4f}-{g['roll_rib']:.4f} m · 폐어망 {g['waste']:.6f} kg")
-        info('B 롤 기하 + D 회수율·두께 가정',f'심지={core:g} m, 회수율={recovery:.2%}, 유효두께·공극 및 압축 미반영',True)
-        cite('Roll');cite('PA6');cite('ABA')
-    with st.expander('2. 매몰부 추정 표면적'):
-        st.latex(r'A_{bur}=f_{bur}A_{total},\quad A_{unbur}=(1-f_{bur})A_{total}')
-        st.write(f"{buried:.4f} × {g['area']:.6f} = {g['area']*buried:.6f} m²")
-        info('D 팀 시나리오 가정','매몰은 공극수 접촉 가능 면적의 기하학적 대용값; 실제 습윤면적 아님',True)
-    with st.expander('3. PA6 질량 기반 누적 용출곡선'):
-        st.latex(r'r_i(t)=C_{e,i}(1-a_i e^{-k_i t}),\quad M_i(t)=m_{PA6}r_i(t)10^4\ (mg)')
-        for name,r in result.items():
-            c=CHEMICALS[name]
-            st.write(f'{name}: Ce={c.ce}, a={c.a}, k={c.k} day⁻¹; {days}일 {r["current"]["rate"]:.8f}% → {r["current"]["total_mg"]:.6f} mg')
-        info('A 문헌 경험식 + B 단위변환','30°C, 1-64일 자료. 65-92일 외삽; 재활용 모노필라멘트 실측 아님',True)
-        cite('Bridson')
-    with st.expander('4. 공극수 배분 및 5. 반감기'):
-        st.latex(r'f_{pw}=f_{bur}\eta_i,\quad\Delta M_{pw,i}(j)=f_{pw}\Delta M_i(j)')
-        st.latex(r'\lambda_i=\ln2/H_i,\quad R_{pw,i}(t)=R_{pw,i}(t-1)e^{-\lambda_i}+\Delta M_{pw,i}(t)')
-        st.write(f'공극수 배분계수 = {buried:.4f} × {eta:.4f} = {buried*eta:.6f} (중복 적용 없음)')
-        for name,r in result.items():
-            st.write(f'{name}: 전체 누적 {r["current"]["total_mg"]:.6f} mg, 공극수 배분 {r["current"]["allocated_mg"]:.6f} mg, 잔존 {r["current"]["remaining_mg"]:.6f} mg; H={halfs[name]} 일')
-        info('B 1차 반응속도론 + D 날짜 말 신규투입·배분 가정','V4 양의 절편이 있지만 M(0)=0으로 두고 첫날 M(1) 전체를 투입. H=5/9.5/14일은 시나리오값',True)
-        cite('Fortmann')
-    with st.expander('6. 모래 공극률 및 7. 포화 공극수량'):
-        st.latex(r'\phi=1-\rho_b/\rho_s,\quad V_{water}=LW(z/100)\phi S_w\times1000\ L')
-        z=result[chosen[0]]
-        st.write(f'1 - {bulk:g}/{particle:g} = {z["porosity"]:.8f}')
-        st.write(f'{g["plan"]:.6f} × {depth:g}/100 × {z["porosity"]:.8f} × {sw:.4f} × 1000 = {z["volume_l"]:.6f} L')
-        info('B 밀도·부피 관계 + D 균일 포화도','용적밀도·입자밀도·수분 포화도는 실측 이전의 설정값',True)
-        cite('Soil')
-    with st.expander('8. 전량 용존 가정 공극수 환산농도'):
-        st.latex(r'C_{pw,i}(z,t)=R_{pw,i}(t)/V_{water}(z)')
-        for name,r in result.items():
-            st.write(f'{name}: {r["current"]["remaining_mg"]:.6f} mg / {r["volume_l"]:.6f} L = '+
-                     (f'{r["current"]["concentration"]:.8f} mg/L' if r['current']['concentration'] is not None else '계산 불가: 공극수 없음'))
-            st.write(f'기간 최고 {r["peak"]} mg/L ({r["peak_day"]}일), 일별 산술평균 {r["average"]} mg/L')
-        info('D 연구팀 단순 완전혼합 환산식','매몰부 유래 용출물이 해당 혼합층 공극수에 모두 용존·균일 혼합되며 흡착·실제 용해도·물질 이동 및 유실 미반영',True)
-        cite('ANZG')
-    with st.expander('9. 굴 깊이 기준 잠재적 공극수 접촉농도'):
-        st.latex(r'C_{burrow,proxy}(z,t)=C_{pw}(z,t)')
-        st.write('선택한 각 깊이 0-z cm 층에 같은 유입량이 균일하게 혼합되는 독립 대안 시나리오입니다. 실제 굴 내 수량, 수리학적 연결, 개체 흡수량을 뜻하지 않습니다.')
-        info('D 생물 노출 대리지표','14.4 cm / 37.6 cm의 해당 생물·정확한 원문 및 대표값 산정 방식 확인 필요',True)
-        cite('Burrow1');cite('Burrow2')
-    with st.expander('10. OECD PNEC 참고 비교'):
-        st.latex(r'Ratio=C_{pw,caprolactam}/0.13')
-        if 'Caprolactam' in result:
-            for k,v in result['Caprolactam']['pnec_ratios'].items(): st.write(f'{k}: {v if v is not None else "계산 불가: 공극수 없음"}')
-        st.write('수환경 녹조류 EC50=130 mg/L에 평가계수 1000을 적용한 PNEC=0.13 mg/L. 조상대 저서생물의 직접 독성기준 아님; 안전성 자동 판정 안 함.')
-        info('A OECD 수환경 PNEC + D 팀 참고비율','노출조건·염분·생물종·시간 차이를 평가하지 않음')
-        cite('OECD')
-    st.caption('자료 구분: A 문헌 기반, B 기본 수학/기하학, C 자체 유도, D 팀 설계·가정. 실측값으로 표시된 수치는 사용자가 직접 입력한 R2 항목뿐입니다.')
+    show_panel(model)
