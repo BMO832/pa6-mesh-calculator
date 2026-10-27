@@ -27,6 +27,10 @@ st.set_page_config(page_title='PA6 Mesh Calculator V4',layout='wide')
 st.markdown('''<style>
 [data-testid="stLatex"] {overflow-x:auto; max-width:100%;}
 [data-testid="stLatex"] .katex-display {overflow-x:auto; overflow-y:hidden; padding: .4rem 0;}
+@media (max-width:850px) {
+  [data-testid="stHorizontalBlock"] {flex-direction:column;}
+  [data-testid="stColumn"] {width:100%; flex:1 1 100%; min-width:0;}
+}
 </style>''', unsafe_allow_html=True)
 st.title('PA6 Mesh Calculator V4')
 st.caption('30°C · 5종 물질 · 누적 용출 / 환경 잔존량 구분 · 참고 시나리오')
@@ -134,3 +138,4 @@ with left:
         st.caption('ρ=1130 kg/m³, ρb=1500 kg/m³와 균일 혼합·날짜 말 투입은 프로그램의 가정입니다. 130 cm는 사용자 제공 뿌리 깊이 참고값으로 원문 출처 미확인, 계산 탐색 상한으로만 사용합니다.')
 with right:
     show_panel(model)
+
